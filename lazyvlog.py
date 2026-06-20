@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lazyvlog.py — Build one chronological slideshow video from a folder of mixed
+lazyvlog.py — Build one chronological slideshow/vlog video from a folder of mixed
 photos and videos, ordered by capture date, with random crossfade transitions
 and per-type transition sound effects. Output is tuned to play on a Samsung
 The Frame (and most TVs): H.264 High, 8-bit yuv420p, auto-selected level, AAC.
@@ -124,6 +124,28 @@ def has_audio(path: str) -> bool:
                      "-show_entries", "stream=index", "-of", "csv=p=0", path]))
 
 
+def probe_wh_fps(path: str):
+    """Return (width, height, fps_or_None) of a media file's video stream.
+    Photos have no real frame rate, so fps is None for them."""
+    s = out(["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,avg_frame_rate",
+             "-of", "csv=p=0", path])
+    parts = s.split(",")
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    w, h = int(parts[0]), int(parts[1])
+    fps = None
+    if len(parts) >= 3 and "/" in parts[2]:
+        num, den = parts[2].split("/")
+        try:
+            num, den = float(num), float(den)
+            if den > 0 and num > 0:
+                fps = num / den
+        except ValueError:
+            pass
+    return w, h, fps
+
+
 # --------------------------------------------------------------------------- #
 # Date extraction: pick the OLDEST timestamp available so true capture order
 # survives even when a transfer (LocalSend, etc.) reset the filesystem times.
@@ -225,6 +247,22 @@ class Clip:
 # --------------------------------------------------------------------------- #
 # STEP 3 — normalize one clip to the uniform format. Cached on disk.
 # --------------------------------------------------------------------------- #
+def legacy_bash_key(c: Clip, a) -> str:
+    """
+    Reproduce EXACTLY the cache filename the old bash script produced, so its
+    already-encoded clips (different naming, same content) can be reused.
+    Bash hashed: abspath|size|mtime|W|H|fps|venc|crf|extra  (sha1, first 16 hex)
+    where venc was the full ffmpeg name and extra was 'd<DUR>' for photos.
+    """
+    st = os.stat(c.src)
+    venc = "h264_nvenc" if a.nvenc else "libx264"
+    # bash used the integer -d value (default 4), e.g. 'd4' not 'd4.0'
+    dur_tok = str(int(a.dur)) if float(a.dur).is_integer() else str(a.dur)
+    extra = f"d{dur_tok}" if c.kind == "photo" else ""
+    return sha(os.path.realpath(c.src), st.st_size, int(st.st_mtime),
+              a.width, a.height, a.fps, venc, a.crf, extra)
+
+
 def normalize_one(c: Clip, a, vopts, cache_dir, work_dir):
     """Re-encode one photo/clip into the shared 4K/30/H264 format used by all."""
     st = os.stat(c.src)
@@ -236,9 +274,27 @@ def normalize_one(c: Clip, a, vopts, cache_dir, work_dir):
     dest_dir = cache_dir if cache_dir else work_dir
     c.norm = os.path.join(dest_dir, f"norm_{key}.mp4")
 
+    # 1) Native Python cache hit.
     if os.path.exists(c.norm) and os.path.getsize(c.norm) > 0:
         log(f"NORMALIZE: cache hit  {os.path.basename(c.src)}")
         return
+
+    # 2) Legacy bash cache hit: same content under the old filename. Adopt it,
+    #    but only if it is genuinely 4:2:0 (reject stale 4:4:4 leftovers).
+    if cache_dir:
+        legacy = os.path.join(cache_dir, f"{legacy_bash_key(c, a)}.mp4")
+        if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+            if probe_pix_fmt(legacy) in ("yuv420p", "yuvj420p"):
+                try:
+                    os.link(legacy, c.norm)        # hardlink: instant, no extra space
+                except OSError:
+                    shutil.copyfile(legacy, c.norm)  # fallback across filesystems
+                log(f"NORMALIZE: reused legacy cache  {os.path.basename(c.src)}")
+                return
+            else:
+                log(f"NORMALIZE: legacy entry for {os.path.basename(c.src)} is not "
+                    f"4:2:0 — re-encoding")
+
     sz = f"{st.st_size // (1024*1024)}M"
     log(f"NORMALIZE: building {c.kind} {os.path.basename(c.src)} ({sz})")
 
@@ -329,6 +385,56 @@ def parallel(jobs: int, tasks):
             f.result()  # re-raise any worker exception, aborting the run
 
 
+def survey_and_cap(clips, a):
+    """
+    STEP 1.5 — inspect every clip's resolution and frame rate, print a summary
+    to help the user pick settings, and CAP the requested output so it can never
+    be larger (more pixels) or faster (higher fps) than the source actually is.
+    Upscaling/interpolating beyond the source adds no real detail, only size and
+    encode time.
+    """
+    res_count, fps_count = {}, {}
+    max_px, max_w, max_h = 0, 0, 0
+    max_fps = 0.0
+    for c in clips:
+        info = probe_wh_fps(c.src)
+        if not info:
+            continue
+        w, h, fps = info
+        res_count[(w, h)] = res_count.get((w, h), 0) + 1
+        if w * h > max_px:
+            max_px, max_w, max_h = w * h, w, h
+        if fps:  # only videos contribute a frame rate
+            rf = round(fps)
+            fps_count[rf] = fps_count.get(rf, 0) + 1
+            max_fps = max(max_fps, fps)
+
+    # Print the distribution.
+    res_str = ", ".join(f"{w}x{h} ({n})" for (w, h), n in
+                        sorted(res_count.items(), key=lambda kv: -kv[0][0] * kv[0][1]))
+    fps_str = ", ".join(f"{r}fps ({n})" for r, n in sorted(fps_count.items())) or "n/a (photos only)"
+    log(f"SURVEY: resolutions: {res_str}")
+    log(f"SURVEY: frame rates: {fps_str}")
+    rec_fps = round(max_fps) if max_fps else a.fps
+    if max_w:
+        log(f"SURVEY: source maximum = {max_w}x{max_h}"
+            + (f" @ {rec_fps}fps" if max_fps else ""))
+        log(f"SURVEY: recommended:   -r {max_w}x{max_h}"
+            + (f" --fps {rec_fps}" if max_fps else ""))
+
+    # CAP resolution: never exceed the largest source frame (by pixel count).
+    if max_px and a.width * a.height > max_px:
+        log(f"CAP: requested {a.width}x{a.height} exceeds source max "
+            f"{max_w}x{max_h}; clamping down (no upscaling).")
+        a.width, a.height = max_w, max_h
+
+    # CAP frame rate: never exceed the fastest source clip.
+    if max_fps and a.fps > rec_fps:
+        log(f"CAP: requested {a.fps}fps exceeds source max {rec_fps}fps; "
+            f"clamping to {rec_fps}.")
+        a.fps = rec_fps
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(
         description="Chronological slideshow video with crossfades + transition SFX.",
@@ -388,15 +494,13 @@ def main(argv):
 
     # Scratch + cache dirs. Warn if scratch is on a tiny RAM disk (tmpfs).
     os.makedirs(a.tmp, exist_ok=True)
-    work = os.path.join(a.tmp, f"lazyvlog_{os.getpid()}")
+    work = os.path.join(a.tmp, f"automovie_{os.getpid()}")
     os.makedirs(work, exist_ok=True)
     if a.cache:
         os.makedirs(a.cache, exist_ok=True)
     free_gb = shutil.disk_usage(work).free // (1024 ** 3)
     if free_gb < 20:
         log(f"WARN: scratch {work} has only {free_gb}G free — 4K needs tens of GB")
-
-    vopts = video_opts(a)
 
     # ---- STEP 1: SCAN ---- find supported media in the source folder.
     if not os.path.isdir(a.src):
@@ -421,6 +525,13 @@ def main(argv):
     clips.sort(key=lambda c: c.date)
     log("DATE: sorted chronologically")
     N = len(clips)
+
+    # ---- STEP 1.5: SURVEY + CAP ---- report source res/fps and prevent upscaling.
+    survey_and_cap(clips, a)
+
+    # Encoder options depend on the (possibly capped) resolution/fps, so build
+    # them now, after the cap.
+    vopts = video_opts(a)
 
     # Sound-effect pools (optional). Files containing 'photo' / 'video' in name.
     photo_sfx, video_sfx = [], []
