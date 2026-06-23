@@ -335,13 +335,13 @@ for s in "${!SEG[@]}"; do
 done
 N=${#SEG[@]}
 
-# ---- clamp xfade if it is too long for the shortest clip ----
+# ---- clamp xfade: must be < half the shortest clip (interior clips fade at both ends) ----
 if awk -v t="$XFADE" 'BEGIN{exit !(t>0)}'; then
   minD=$(printf '%s\n' "${SEGDUR[@]}" | sort -n | head -1)
-  if awk -v t="$XFADE" -v m="$minD" 'BEGIN{exit !(t>=m)}'; then
+  if awk -v t="$XFADE" -v m="$minD" 'BEGIN{exit !(2*t>=m)}'; then
     NEWX=$(awk -v m="$minD" 'BEGIN{printf "%.3f", m*0.25}')
     if awk -v x="$NEWX" 'BEGIN{exit !(x>0)}'; then
-      log "WARN: --xfade $XFADE >= shortest clip ${minD}s; reducing to ${NEWX}s (25% of shortest)"
+      log "WARN: --xfade $XFADE too long for shortest clip ${minD}s; reducing to ${NEWX}s (25% of shortest)"
       XFADE="$NEWX"
     else
       log "WARN: shortest clip ${minD}s too short for any crossfade; using hard cuts"
@@ -368,73 +368,106 @@ XPOOL=(fade fadeblack dissolve wipeleft wiperight wipeup wipedown \
        slideleft slideright slideup slidedown smoothleft smoothright \
        smoothup smoothdown circleopen circleclose radial pixelize)
 
-# ---- build base track ----
-BASE="$WORK/base.mp4"
+# ---- build video track ----
+# Windowed crossfade: each clip is trimmed (frame-exact) into body + head/tail
+# pieces; only the short transition windows are re-encoded; bodies concatenate
+# by copy; audio is built in one continuous pass. Memory stays flat, heavy clips
+# are encoded once (not re-encoded per merge), and cuts are frame-exact.
+VIDEO="$WORK/video.mp4"
+AUDIO="$WORK/audio.m4a"
+XF=$(awk -v x="$XFADE" -v f="$FPS" 'BEGIN{printf "%d", x*f + 0.5}')
+
+vtrim(){ # in out start_frame [end_frame]
+  local in="$1" out="$2" sf="$3" ef="${4:-}" ex
+  if [ -n "$ef" ]; then ex="trim=start_frame=${sf}:end_frame=${ef}"; else ex="trim=start_frame=${sf}"; fi
+  ffmpeg -y -loglevel error -i "$in" -filter_complex \
+    "[0:v]${ex},setpts=PTS-STARTPTS,format=yuv420p,setsar=1[v]" \
+    -map "[v]" -an "${VOPTS[@]}" -movflags +faststart "$out"
+}
+
 if awk -v t="$XFADE" 'BEGIN{exit !(t>0)}' && [ "$N" -ge 2 ]; then
-  log "TRANSITION: xfade '$XTYPE' ${XFADE}s, pairwise (2 inputs/pass, low memory)"
-  # Pairwise tree reduction: each pass xfades adjacent pairs, halving the count.
-  # Only two clips are decoded per ffmpeg call, so memory stays flat for any N.
-  cur_f=("${SEG[@]}"); cur_d=("${SEGDUR[@]}")
-  level=0
-  while [ "${#cur_f[@]}" -gt 1 ]; do
-    next_f=(); next_d=(); k=0; pair=0
-    while [ "$k" -lt "${#cur_f[@]}" ]; do
-      if [ "$((k+1))" -lt "${#cur_f[@]}" ]; then
-        L="${cur_f[$k]}"; Ld="${cur_d[$k]}"
-        R="${cur_f[$((k+1))]}"; Rd="${cur_d[$((k+1))]}"
-        off=$(awk -v a="$Ld" -v t="$XFADE" 'BEGIN{v=a-t; if(v<0)v=0; printf "%.3f", v}')
-        if [ "$XTYPE" = random ]; then xt="${XPOOL[$((RANDOM % ${#XPOOL[@]}))]}"; else xt="$XTYPE"; fi
-        out="$WORK/m_${level}_${pair}.mp4"
-        log "TRANSITION: L${level} merge $((pair+1)) -> $xt"
-        ffmpeg -y -loglevel error -i "$L" -i "$R" -filter_complex \
-          "[0:v]format=yuv420p,setsar=1,fps=${FPS}[v0];[1:v]format=yuv420p,setsar=1,fps=${FPS}[v1];[v0][v1]xfade=transition=${xt}:duration=${XFADE}:offset=${off},format=yuv420p[v];[0:a][1:a]acrossfade=d=${XFADE}:c1=tri:c2=tri[a]" \
-          -map "[v]" -map "[a]" "${VOPTS[@]}" -c:a aac -b:a 192k -movflags +faststart "$out"
-        nd=$(awk -v a="$Ld" -v b="$Rd" -v t="$XFADE" 'BEGIN{printf "%.6f", a+b-t}')
-        next_f+=("$out"); next_d+=("$nd")
-        [[ "$L" == "$WORK/m_"* ]] && rm -f "$L"
-        [[ "$R" == "$WORK/m_"* ]] && rm -f "$R"
-        k=$((k+2)); pair=$((pair+1))
-      else
-        next_f+=("${cur_f[$k]}"); next_d+=("${cur_d[$k]}")  # odd one carries up
-        k=$((k+1))
-      fi
-    done
-    cur_f=("${next_f[@]}"); cur_d=("${next_d[@]}"); level=$((level+1))
+  log "TRANSITION: windowed xfade '$XTYPE' ${XFADE}s (frame-exact, re-encode only ${XF}-frame windows)"
+  declare -a DF=()
+  for s in "${!SEG[@]}"; do DF[$s]=$(awk -v d="${SEGDUR[$s]}" -v f="$FPS" 'BEGIN{printf "%d", d*f + 0.5}'); done
+
+  # bodies + tails/heads
+  for i in "${!SEG[@]}"; do
+    df=${DF[$i]}
+    if [ "$i" -eq 0 ]; then
+      vtrim "${SEG[$i]}" "$WORK/body_$i.mp4" 0 $((df-XF))
+      vtrim "${SEG[$i]}" "$WORK/tail_$i.mp4" $((df-XF))
+    elif [ "$i" -eq $((N-1)) ]; then
+      vtrim "${SEG[$i]}" "$WORK/head_$i.mp4" 0 "$XF"
+      vtrim "${SEG[$i]}" "$WORK/body_$i.mp4" "$XF"
+    else
+      vtrim "${SEG[$i]}" "$WORK/head_$i.mp4" 0 "$XF"
+      vtrim "${SEG[$i]}" "$WORK/body_$i.mp4" "$XF" $((df-XF))
+      vtrim "${SEG[$i]}" "$WORK/tail_$i.mp4" $((df-XF))
+    fi
+    log "TRIM: [$((i+1))/$N] ${SEGTYPE[$i]} pieces ready"
   done
-  mv "${cur_f[0]}" "$BASE"
+
+  # transition windows (re-encode, XF frames each)
+  for i in $(seq 0 $((N-2))); do
+    j=$((i+1))
+    if [ "$XTYPE" = random ]; then xt="${XPOOL[$((RANDOM % ${#XPOOL[@]}))]}"; else xt="$XTYPE"; fi
+    log "TRANSITION: window $((i+1))/$((N-1)) -> $xt"
+    ffmpeg -y -loglevel error -i "$WORK/tail_$i.mp4" -i "$WORK/head_$j.mp4" -filter_complex \
+      "[0:v]format=yuv420p,setsar=1,fps=${FPS}[a];[1:v]format=yuv420p,setsar=1,fps=${FPS}[b];[a][b]xfade=transition=${xt}:duration=${XFADE}:offset=0,format=yuv420p[v]" \
+      -map "[v]" -an "${VOPTS[@]}" -movflags +faststart "$WORK/win_$i.mp4"
+  done
+
+  # concat bodies + windows (copy)
+  VLIST="$WORK/vlist.txt"; : > "$VLIST"
+  for i in "${!SEG[@]}"; do
+    echo "file 'body_$i.mp4'" >> "$VLIST"
+    [ "$i" -lt $((N-1)) ] && echo "file 'win_$i.mp4'" >> "$VLIST"
+  done
+  ffmpeg -y -loglevel error -f concat -safe 0 -i "$VLIST" -an -c copy -movflags +faststart "$VIDEO"
+
+  # audio: one continuous acrossfade pass over all clips (cheap, no drift)
+  log "AUDIO: single-pass acrossfade over $N clips"
+  ains=(); af=""; pa="[0:a]"
+  for i in "${!SEG[@]}"; do ains+=(-i "${SEG[$i]}"); done
+  for ((k=1;k<N;k++)); do af+="${pa}[${k}:a]acrossfade=d=${XFADE}:c1=tri:c2=tri[ax${k}];"; pa="[ax${k}]"; done
+  af="${af%;}"
+  ffmpeg -y -loglevel error "${ains[@]}" -filter_complex "$af" -map "$pa" -c:a aac -b:a 192k -ar 48000 "$AUDIO"
 else
   log "TRANSITION: hard cuts, concat $N clips"
-  ffmpeg -y -loglevel error -f concat -safe 0 -i "$LIST" -c copy -movflags +faststart "$BASE"
+  ffmpeg -y -loglevel error -f concat -safe 0 -i "$LIST" -an -c copy -movflags +faststart "$VIDEO"
+  # audio: concat clip audio (no crossfade)
+  ains=(); ac=""
+  for i in "${!SEG[@]}"; do ains+=(-i "${SEG[$i]}"); ac+="[${i}:a]"; done
+  ffmpeg -y -loglevel error "${ains[@]}" -filter_complex "${ac}concat=n=${N}:v=0:a=1[a]" -map "[a]" -c:a aac -b:a 192k -ar 48000 "$AUDIO"
 fi
 
-# ---- inject transition SFX, or finish ----
-if [ -z "$SFXDIR" ] || { [ "${#PHOTO_SFX[@]}" -eq 0 ] && [ "${#VIDEO_SFX[@]}" -eq 0 ]; }; then
-  log "SFX: none — finishing"
-  cp "$BASE" "$OUT"; verify_out; log "DONE: $OUT"; echo "done: $OUT"; exit 0
+# ---- overlay transition SFX onto the audio track (or pass through) ----
+FINAL_A="$AUDIO"
+if [ -n "$SFXDIR" ] && { [ "${#PHOTO_SFX[@]}" -gt 0 ] || [ "${#VIDEO_SFX[@]}" -gt 0 ]; }; then
+  log "SFX: assigning transition effects"
+  inputs=(-i "$AUDIO"); filter=""; amix_in="[0:a]"; n=0; idx=1
+  for s in "${!SEGTYPE[@]}"; do
+    if [ "${SEGTYPE[$s]}" = photo ]; then pool=("${PHOTO_SFX[@]}"); else pool=("${VIDEO_SFX[@]}"); fi
+    [ "${#pool[@]}" -eq 0 ] && continue
+    sfx="${pool[$((RANDOM % ${#pool[@]}))]}"
+    ms="${START_MS[$s]}"
+    log "SFX: seg $((s+1)) ${SEGTYPE[$s]} @${ms}ms <- ${sfx##*/}"
+    inputs+=(-i "$sfx")
+    filter+="[${idx}:a]adelay=${ms}:all=1,volume=${SFXGAIN}[s${idx}];"
+    amix_in+="[s${idx}]"
+    idx=$((idx+1)); n=$((n+1))
+  done
+  if [ "$n" -gt 0 ]; then
+    log "MIX: overlaying $n effects"
+    filter+="${amix_in}amix=inputs=$((n+1)):normalize=0:duration=first[aout]"
+    ffmpeg -y -loglevel error "${inputs[@]}" -filter_complex "$filter" -map "[aout]" -c:a aac -b:a 192k -ar 48000 "$WORK/audio_sfx.m4a"
+    FINAL_A="$WORK/audio_sfx.m4a"
+  fi
 fi
 
-log "SFX: assigning transition effects"
-inputs=(-i "$BASE")
-filter=""; amix_in="[0:a]"; n=0; idx=1
-for s in "${!SEGTYPE[@]}"; do
-  if [ "${SEGTYPE[$s]}" = photo ]; then pool=("${PHOTO_SFX[@]}"); else pool=("${VIDEO_SFX[@]}"); fi
-  [ "${#pool[@]}" -eq 0 ] && continue
-  sfx="${pool[$((RANDOM % ${#pool[@]}))]}"
-  ms="${START_MS[$s]}"
-  log "SFX: seg $((s+1)) ${SEGTYPE[$s]} @${ms}ms <- ${sfx##*/}"
-  inputs+=(-i "$sfx")
-  filter+="[${idx}:a]adelay=${ms}:all=1,volume=${SFXGAIN}[s${idx}];"
-  amix_in+="[s${idx}]"
-  idx=$((idx+1)); n=$((n+1))
-done
-
-if [ "$n" -eq 0 ]; then
-  cp "$BASE" "$OUT"; verify_out; log "DONE: $OUT"; echo "done: $OUT"; exit 0
-fi
-log "MIX: overlaying $n effects onto final track"
-filter+="${amix_in}amix=inputs=$((n+1)):normalize=0:duration=first[aout]"
-ffmpeg -y -loglevel error "${inputs[@]}" -filter_complex "$filter" \
-  -map 0:v -map "[aout]" -c:v copy -c:a aac -b:a 192k -movflags +faststart "$OUT"
+# ---- mux video + audio ----
+log "MUX: combining video + audio"
+ffmpeg -y -loglevel error -i "$VIDEO" -i "$FINAL_A" -map 0:v -map 1:a -c copy -shortest -movflags +faststart "$OUT"
 verify_out
 log "DONE: $OUT"
 echo "done: $OUT"
